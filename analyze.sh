@@ -38,7 +38,6 @@ show_help() {
     echo -e "  ${GREEN}users${NC}        Analyze traffic by user"
     echo -e "  ${GREEN}hourly${NC}       Error rate by hour"
     echo -e "  ${GREEN}investigate${NC}  Deep dive on specific IP or user"
-    echo -e "  ${GREEN}report${NC}       Generate full incident report"
     echo ""
     echo -e "${BOLD}Examples:${NC}"
     echo "  ./analyze.sh summary"
@@ -85,20 +84,16 @@ cmd_errors() {
     echo -e "${CYAN}╚══════════════════════════════════════════════════════════════╝${NC}"
     echo ""
     
-    total=$(wc -l < "$LOG_FILE")
-    total_errors=$(grep -cE " 5[0-9]{2} " "$LOG_FILE")
-    
-    echo -e "  ${BOLD}Error Breakdown:${NC}"
+    echo -e "  ${BOLD}Error Breakdown (5xx only):${NC}"
     echo -e "  ─────────────────────────────────"
-    grep -oE " 5[0-9]{2} " "$LOG_FILE" | sort | uniq -c | sort -rn | while read count code; do
-        code=$(echo $code | xargs)
+    awk '$9 ~ /^5[0-9][0-9]$/ {print $9}' "$LOG_FILE" | sort | uniq -c | sort -rn | while read count code; do
         printf "    Status %s: %s occurrences\n" "$code" "$count"
     done
     echo ""
     
     echo -e "  ${BOLD}Top 5 IPs Causing Errors:${NC}"
     echo -e "  ─────────────────────────────────"
-    grep -E " 5[0-9]{2} " "$LOG_FILE" | awk '{print $1}' | sort | uniq -c | sort -rn | head -5 | while read count ip; do
+    awk '$9 ~ /^5[0-9][0-9]$/ {print $1}' "$LOG_FILE" | sort | uniq -c | sort -rn | head -5 | while read count ip; do
         ip_total=$(grep -c "^$ip " "$LOG_FILE")
         rate=$(awk "BEGIN {printf \"%.1f\", ($count/$ip_total)*100}")
         printf "    %-18s %3s errors (%s%% of their requests)\n" "$ip" "$count" "$rate"
@@ -107,14 +102,14 @@ cmd_errors() {
     
     echo -e "  ${BOLD}Top 5 Endpoints with Errors:${NC}"
     echo -e "  ─────────────────────────────────"
-    grep -E " 5[0-9]{2} " "$LOG_FILE" | awk -F'"' '{print $2}' | awk '{print $2}' | sort | uniq -c | sort -rn | head -5 | while read count endpoint; do
+    awk '$9 ~ /^5[0-9][0-9]$/' "$LOG_FILE" | awk -F'"' '{print $2}' | awk '{print $2}' | sort | uniq -c | sort -rn | head -5 | while read count endpoint; do
         printf "    %-20s %s errors\n" "$endpoint" "$count"
     done
     echo ""
     
     echo -e "  ${BOLD}Recent Errors (last 5):${NC}"
     echo -e "  ─────────────────────────────────"
-    grep -E " 5[0-9]{2} " "$LOG_FILE" | tail -5 | while read line; do
+    awk '$9 ~ /^5[0-9][0-9]$/' "$LOG_FILE" | tail -5 | while read line; do
         echo -e "    ${RED}$line${NC}"
     done
 }
@@ -169,7 +164,7 @@ cmd_ips() {
     echo -e "  ─────────────────────────────────────────────────────────"
     
     awk '{print $1}' "$LOG_FILE" | sort | uniq -c | sort -rn | while read count ip; do
-        errors=$(grep "^$ip " "$LOG_FILE" | grep -cE " 5[0-9]{2} ")
+        errors=$(awk -v ip="$ip" '$1 == ip && $9 ~ /^5[0-9][0-9]$/' "$LOG_FILE" | wc -l)
         rate=$(awk "BEGIN {printf \"%.1f\", ($errors/$count)*100}")
         
         if (( $(echo "$rate > 20" | bc -l) )); then
@@ -198,10 +193,9 @@ cmd_users() {
     
     awk '{print $3}' "$LOG_FILE" | sort | uniq -c | sort -rn | while read count user; do
         percent=$(awk "BEGIN {printf \"%.1f\", ($count/$total)*100}")
-        errors=$(awk -v u="$user" '$3 == u' "$LOG_FILE" | grep -cE " 5[0-9]{2} ")
+        errors=$(awk -v u="$user" '$3 == u && $9 ~ /^5[0-9][0-9]$/' "$LOG_FILE" | wc -l)
         err_rate=$(awk "BEGIN {printf \"%.1f\", ($errors/$count)*100}")
         
-        # Flag suspicious users (>20% of traffic OR >20% error rate)
         if (( $(echo "$percent > 20" | bc -l) )) || (( $(echo "$err_rate > 20" | bc -l) )); then
             printf "    ${YELLOW}%-15s %8s %7s%% %8s %7s%%${NC} ⚠️\n" "$user" "$count" "$percent" "$errors" "$err_rate"
         else
@@ -225,12 +219,11 @@ cmd_hourly() {
     for hour in $(seq 0 23); do
         total=$(grep ":${hour}:" "$LOG_FILE" | wc -l)
         if [ $total -gt 0 ]; then
-            errors=$(grep ":${hour}:" "$LOG_FILE" | grep -cE " 5[0-9]{2} ")
+            errors=$(grep ":${hour}:" "$LOG_FILE" | awk '$9 ~ /^5[0-9][0-9]$/' | wc -l)
             rate=$(awk "BEGIN {printf \"%.1f\", ($errors/$total)*100}")
             
-            # Visual bar
             bar_length=$(awk "BEGIN {printf \"%.0f\", $rate/2}")
-            bar=$(printf '%*s' "$bar_length" | tr ' ' '█')
+            bar=$(printf '%*s' "$bar_length" | tr ' ' '#')
             
             if (( $(echo "$rate > 20" | bc -l) )); then
                 printf "    ${RED}%5s %10s %8s %9s%% %s${NC}\n" "$hour:00" "$total" "$errors" "$rate" "$bar"
@@ -243,34 +236,87 @@ cmd_hourly() {
     done
 }
 
-# Main script logic
+# Investigate command
+cmd_investigate() {
+    local target="$1"
+    
+    if [ -z "$target" ]; then
+        echo -e "${RED}Error: Please specify an IP or username${NC}"
+        echo "Usage: ./analyze.sh investigate <IP or username>"
+        exit 1
+    fi
+    
+    echo -e "${CYAN}╔══════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${CYAN}║${NC}              🔍 ${BOLD}INVESTIGATING: $target${NC}"
+    echo -e "${CYAN}╚══════════════════════════════════════════════════════════════╝${NC}"
+    echo ""
+    
+    # Check if IP or username
+    if [[ "$target" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        matches=$(grep "^$target " "$LOG_FILE")
+    else
+        matches=$(awk -v user="$target" '$3 == user' "$LOG_FILE")
+    fi
+    
+    total=$(echo "$matches" | grep -c .)
+    
+    if [ "$total" -eq 0 ]; then
+        echo -e "${RED}No records found for: $target${NC}"
+        exit 1
+    fi
+    
+    errors=$(echo "$matches" | awk '$9 ~ /^5[0-9][0-9]$/' | wc -l)
+    error_rate=$(awk "BEGIN {printf \"%.1f\", ($errors/$total)*100}")
+    
+    echo -e "  ${BOLD}Overview:${NC}"
+    echo "    Total Requests:  $total"
+    echo "    Errors (5xx):    $errors (${error_rate}%)"
+    echo ""
+    
+    echo -e "  ${BOLD}Status Codes:${NC}"
+    echo "$matches" | awk '{print $9}' | sort | uniq -c | sort -rn | head -5 | while read count code; do
+        printf "    %s: %s\n" "$code" "$count"
+    done
+    echo ""
+    
+    echo -e "  ${BOLD}Top Endpoints:${NC}"
+    echo "$matches" | awk -F'"' '{print $2}' | awk '{print $2}' | sort | uniq -c | sort -rn | head -5 | while read count ep; do
+        printf "    %-25s %s\n" "$ep" "$count"
+    done
+    echo ""
+    
+    echo -e "  ${BOLD}Response Times:${NC}"
+    avg=$(echo "$matches" | awk '{sum+=$NF; c++} END {printf "%.3f", sum/c}')
+    max=$(echo "$matches" | awk '{print $NF}' | sort -rn | head -1)
+    echo "    Average: ${avg}s"
+    echo "    Slowest: ${max}s"
+    echo ""
+    
+    if [ "$errors" -gt 0 ]; then
+        echo -e "  ${BOLD}Sample Errors:${NC}"
+        echo "$matches" | awk '$9 ~ /^5[0-9][0-9]$/' | head -5 | while read line; do
+            ts=$(echo "$line" | awk -F'[][]' '{print $2}')
+            ep=$(echo "$line" | awk -F'"' '{print $2}' | awk '{print $2}')
+            st=$(echo "$line" | awk '{print $9}')
+            echo -e "    ${RED}[$ts] $ep -> $st${NC}"
+        done
+    fi
+}
+
+# Main
 check_log
 
 case "${1:-help}" in
-    summary)
-        cmd_summary
-        ;;
-    errors)
-        cmd_errors
-        ;;
-    slow)
-        cmd_slow "$2"
-        ;;
-    ips)
-        cmd_ips
-        ;;
-    users)
-        cmd_users
-        ;;
-    hourly)
-        cmd_hourly
-        ;;
+    summary)     cmd_summary ;;
+    errors)      cmd_errors ;;
+    slow)        cmd_slow "$2" ;;
+    ips)         cmd_ips ;;
+    users)       cmd_users ;;
+    hourly)      cmd_hourly ;;
+    investigate) cmd_investigate "$2" ;;
     help|--help|-h|"")
-        show_help
-        ;;
+        show_help ;;
     *)
         echo -e "${RED}Unknown command: $1${NC}"
-        echo "Run './analyze.sh help' for usage"
-        exit 1
-        ;;
+        exit 1 ;;
 esac
