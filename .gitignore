@@ -1,0 +1,15 @@
+# Log files - never commit these (can be huge!)
+logs/*.log
+logs/*.txt
+
+# Database files - contain generated data
+data/*.db
+
+# Temporary files
+*.tmp
+*.swp
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
